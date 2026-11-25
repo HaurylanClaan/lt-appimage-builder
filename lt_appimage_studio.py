@@ -67,9 +67,16 @@ ui_error() {
 }
 
 ui_question() {
+    local rc=0
     case "$UI" in
-        zenity)  zenity --question --title="$TITLE" --text="$1" --width=460 ;;
-        kdialog) kdialog --title="$TITLE" --yesno "$1" ;;
+        zenity)
+            zenity --question --title="$TITLE" --text="$1" --width=460 || rc=$?
+            return $rc
+            ;;
+        kdialog)
+            kdialog --title="$TITLE" --yesno "$1" || rc=$?
+            return $rc
+            ;;
         cli)
             echo -e "\n$1 [s/N]"
             read -r resp
@@ -78,10 +85,55 @@ ui_question() {
     esac
 }
 
+# Retorna: 0 = Desinstalar e Restaurar | 1 = Reinstalar | 2 = Cancelar
+ui_installed_menu() {
+    local msg="$1"
+    local rc=0
+    local out=""
+    case "$UI" in
+        zenity)
+            out=$(zenity --question \
+                --title="$TITLE" \
+                --text="$msg" \
+                --ok-label="Desinstalar e Restaurar Backup" \
+                --cancel-label="Cancelar" \
+                --extra-button="Reinstalar / Atualizar" \
+                --width=490 2>/dev/null) || rc=$?
+            if [ $rc -eq 0 ]; then
+                return 0
+            elif [ "$out" = "Reinstalar / Atualizar" ]; then
+                return 1
+            else
+                return 2
+            fi
+            ;;
+        kdialog)
+            kdialog --title="$TITLE" \
+                --yesnocancel "$msg" \
+                --yes-label="Desinstalar e Restaurar Backup" \
+                --no-label="Reinstalar / Atualizar" \
+                --cancel-label="Cancelar" || rc=$?
+            return $rc
+            ;;
+        cli)
+            echo -e "\n$msg"
+            echo "1) Desinstalar e Restaurar Backup"
+            echo "2) Reinstalar / Atualizar"
+            echo "0) Cancelar"
+            read -r opt
+            case "$opt" in
+                1) return 0 ;;
+                2) return 1 ;;
+                *) return 2 ;;
+            esac
+            ;;
+    esac
+}
+
 ui_select_dir() {
     case "$UI" in
-        zenity)  zenity --file-selection --directory --title="Selecione a pasta do jogo: $GAME_NAME" ;;
-        kdialog) kdialog --title="Selecione a pasta do jogo: $GAME_NAME" --getexistingdirectory "$HOME" ;;
+        zenity)  zenity --file-selection --directory --title="Selecione a pasta do jogo: $GAME_NAME" || true ;;
+        kdialog) kdialog --title="Selecione a pasta do jogo: $GAME_NAME" --getexistingdirectory "$HOME" || true ;;
         cli)
             echo "Digite o caminho completo da pasta do jogo ($GAME_NAME):" >&2
             read -r custom_dir
@@ -154,61 +206,132 @@ find_game_dir() {
     return 1
 }
 
+get_target_dir() {
+    local root="$1"
+    if [ -n "$SUB_PATH" ] && [ "$SUB_PATH" != "." ]; then
+        echo "$root/$SUB_PATH"
+    else
+        echo "$root"
+    fi
+}
+
+# --- Verifica se a tradução já está instalada na pasta do jogo ---
+is_translation_installed() {
+    local game_root="$1"
+    local target_dir
+    target_dir="$(get_target_dir "$game_root")"
+
+    if [ -d "$game_root/_backup_linux_traducoes" ]; then
+        return 0
+    fi
+
+    while IFS= read -r -d '' rel_file; do
+        local clean_rel="${rel_file#./}"
+        if [ -f "$target_dir/$clean_rel" ] && cmp -s "$APPDIR/payload/$clean_rel" "$target_dir/$clean_rel"; then
+            return 0
+        fi
+    done < <(cd "$APPDIR/payload" && find . -type f -print0)
+
+    return 1
+}
+
+# --- Desinstala a tradução e restaura o backup original ---
+uninstall_translation() {
+    local game_root="$1"
+    local target_dir
+    target_dir="$(get_target_dir "$game_root")"
+    local backup_dir="$game_root/_backup_linux_traducoes"
+    local backup_files="$backup_dir/files"
+
+    while IFS= read -r -d '' rel_file; do
+        local clean_rel="${rel_file#./}"
+        local dest_file="$target_dir/$clean_rel"
+
+        if [ -f "$backup_files/$clean_rel" ]; then
+            mkdir -p "$(dirname "$dest_file")"
+            cp -pf "$backup_files/$clean_rel" "$dest_file"
+        elif [ -f "$backup_dir/$clean_rel" ]; then
+            # Compatibilidade com backups criados pela versão anterior do gerador
+            mkdir -p "$(dirname "$dest_file")"
+            cp -pf "$backup_dir/$clean_rel" "$dest_file"
+        else
+            # Arquivo novo adicionado pela tradução: remove e limpa pastas vazias
+            rm -f "$dest_file"
+            local parent_dir
+            parent_dir="$(dirname "$dest_file")"
+            while [ "$parent_dir" != "$target_dir" ] && [ "$parent_dir" != "$game_root" ] && [ "$parent_dir" != "/" ]; do
+                rmdir "$parent_dir" 2>/dev/null || break
+                parent_dir="$(dirname "$parent_dir")"
+            done
+        fi
+    done < <(cd "$APPDIR/payload" && find . -type f -print0)
+
+    rm -rf "$backup_dir"
+    ui_info "Tradução de <b>$GAME_NAME</b> removida e arquivos originais restaurados com sucesso!"
+}
+
 # --- Fluxo Principal ---
 TITLE="Linux Traduções - $GAME_NAME"
 FOUND_DIR="$(find_game_dir || true)"
 GAME_ROOT=""
 
 if [ -n "$FOUND_DIR" ]; then
-    if ui_question "Jogo encontrado automaticamente!\n\n<b>Jogo:</b> $GAME_NAME\n<b>Local:</b> $FOUND_DIR\n<b>Créditos:</b> $CREDITS\n\nDeseja continuar neste diretório?"; then
-        GAME_ROOT="$FOUND_DIR"
+    if is_translation_installed "$FOUND_DIR"; then
+        rc=0
+        ui_installed_menu "A tradução de <b>$GAME_NAME</b> já está instalada em:\n\n<b>$FOUND_DIR</b>\n\nDeseja desinstalar a tradução e recuperar o backup original?" || rc=$?
+        if [ $rc -eq 0 ]; then
+            uninstall_translation "$FOUND_DIR"
+            exit 0
+        elif [ $rc -eq 1 ]; then
+            GAME_ROOT="$FOUND_DIR"
+        else
+            exit 0
+        fi
+    else
+        if ui_question "Jogo encontrado automaticamente!\n\n<b>Jogo:</b> $GAME_NAME\n<b>Local:</b> $FOUND_DIR\n<b>Créditos:</b> $CREDITS\n\nDeseja instalar a tradução neste diretório?"; then
+            GAME_ROOT="$FOUND_DIR"
+        fi
     fi
 fi
 
 if [ -z "$GAME_ROOT" ]; then
     ui_info "Selecione manualmente a pasta raiz onde <b>$GAME_NAME</b> está instalado."
     GAME_ROOT="$(ui_select_dir || true)"
-fi
 
-if [ -z "$GAME_ROOT" ] || [ ! -d "$GAME_ROOT" ]; then
-    ui_error "Nenhuma pasta válida foi selecionada. Operação cancelada."
-    exit 1
-fi
+    if [ -z "$GAME_ROOT" ] || [ ! -d "$GAME_ROOT" ]; then
+        ui_error "Nenhuma pasta válida foi selecionada. Operação cancelada."
+        exit 1
+    fi
 
-BACKUP_DIR="$GAME_ROOT/_backup_linux_traducoes"
-
-# Se já houver backup, oferece opção de restaurar (desinstalar)
-if [ -d "$BACKUP_DIR" ]; then
-    if ! ui_question "Uma instalação anterior da tradução foi detectada.\n\nClique em <b>Sim</b> para REINSTALAR / ATUALIZAR a tradução.\nClique em <b>Não</b> para RESTAURAR o backup original (desinstalar)."; then
-        TARGET_RESTORE="$GAME_ROOT"
-        if [ -n "$SUB_PATH" ] && [ "$SUB_PATH" != "." ]; then
-            TARGET_RESTORE="$GAME_ROOT/$SUB_PATH"
+    if is_translation_installed "$GAME_ROOT"; then
+        rc=0
+        ui_installed_menu "A tradução de <b>$GAME_NAME</b> já está instalada nesta pasta.\n\nDeseja desinstalar a tradução e recuperar o backup original?" || rc=$?
+        if [ $rc -eq 0 ]; then
+            uninstall_translation "$GAME_ROOT"
+            exit 0
+        elif [ $rc -ne 1 ]; then
+            exit 0
         fi
-        cp -rf "$BACKUP_DIR/." "$TARGET_RESTORE/"
-        rm -rf "$BACKUP_DIR"
-        ui_info "Backup original restaurado com sucesso! A tradução foi removida."
-        exit 0
     fi
 fi
 
-TARGET_DIR="$GAME_ROOT"
-if [ -n "$SUB_PATH" ] && [ "$SUB_PATH" != "." ]; then
-    TARGET_DIR="$GAME_ROOT/$SUB_PATH"
-    mkdir -p "$TARGET_DIR"
-fi
+TARGET_DIR="$(get_target_dir "$GAME_ROOT")"
+mkdir -p "$TARGET_DIR"
+
+BACKUP_DIR="$GAME_ROOT/_backup_linux_traducoes"
+BACKUP_FILES="$BACKUP_DIR/files"
+mkdir -p "$BACKUP_FILES"
 
 # --- Backup dos arquivos originais que serão substituídos ---
-mkdir -p "$BACKUP_DIR"
-cd "$APPDIR/payload"
-find . -type f | while IFS= read -r rel_file; do
+while IFS= read -r -d '' rel_file; do
     clean_rel="${rel_file#./}"
     dest_file="$TARGET_DIR/$clean_rel"
     if [ -f "$dest_file" ]; then
-        backup_target="$BACKUP_DIR/$clean_rel"
+        backup_target="$BACKUP_FILES/$clean_rel"
         mkdir -p "$(dirname "$backup_target")"
         [ ! -f "$backup_target" ] && cp -p "$dest_file" "$backup_target"
     fi
-done
+done < <(cd "$APPDIR/payload" && find . -type f -print0)
 
 # --- Copia os arquivos da tradução ---
 cp -rf "$APPDIR/payload/." "$TARGET_DIR/"
