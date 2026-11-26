@@ -33,6 +33,7 @@ JUNK_NAMES = {
     "$pluginsdir",
     "desktop.ini",
     "thumbs.db",
+    ".ds_store",
 }
 
 APPRUN_SCRIPT = r"""#!/usr/bin/env bash
@@ -66,6 +67,40 @@ ui_error() {
     esac
 }
 
+# Retorna: 0 = Selecionar Manualmente | 1 = Fechar (Erro)
+ui_game_not_found() {
+    local msg="<b>Erro:</b> O jogo <b>$GAME_NAME</b> não foi encontrado instalado neste computador.\n\nCertifique-se de que o jogo está instalado na Steam, Heroic ou Lutris e tente novamente."
+    local rc=0
+    local out=""
+    case "$UI" in
+        zenity)
+            out=$(zenity --error \
+                --title="$TITLE" \
+                --text="$msg" \
+                --ok-label="Fechar" \
+                --extra-button="Selecionar Pasta Manualmente" \
+                --width=470 2>/dev/null) || rc=$?
+            if [ "$out" = "Selecionar Pasta Manualmente" ]; then
+                return 0
+            fi
+            return 1
+            ;;
+        kdialog)
+            kdialog --title="$TITLE" \
+                --warningyesno "$msg\n\nDeseja localizar a pasta manualmente?" \
+                --yes-label="Selecionar Pasta Manualmente" \
+                --no-label="Fechar" || rc=$?
+            return $rc
+            ;;
+        cli)
+            echo -e "\n[ERRO] O jogo $GAME_NAME não foi encontrado instalado neste computador." >&2
+            echo "Deseja informar o caminho manualmente? [s/N]" >&2
+            read -r resp
+            [[ "$resp" =~ ^[sSyY]$ ]]
+            ;;
+    esac
+}
+
 ui_question() {
     local rc=0
     case "$UI" in
@@ -92,12 +127,12 @@ ui_installed_menu() {
     local out=""
     case "$UI" in
         zenity)
-            out=$(zenity --question \
+            out=$(zenity --info \
                 --title="$TITLE" \
                 --text="$msg" \
                 --ok-label="Desinstalar e Restaurar Backup" \
-                --cancel-label="Cancelar" \
                 --extra-button="Reinstalar / Atualizar" \
+                --extra-button="Cancelar" \
                 --width=490 2>/dev/null) || rc=$?
             if [ $rc -eq 0 ]; then
                 return 0
@@ -220,19 +255,22 @@ is_translation_installed() {
     local game_root="$1"
     local target_dir
     target_dir="$(get_target_dir "$game_root")"
-
-    if [ -d "$game_root/_backup_linux_traducoes" ]; then
-        return 0
-    fi
+    local total_files=0
 
     while IFS= read -r -d '' rel_file; do
         local clean_rel="${rel_file#./}"
-        if [ -f "$target_dir/$clean_rel" ] && cmp -s "$APPDIR/payload/$clean_rel" "$target_dir/$clean_rel"; then
-            return 0
+        total_files=$((total_files + 1))
+        if [ ! -f "$target_dir/$clean_rel" ] || ! cmp -s "$APPDIR/payload/$clean_rel" "$target_dir/$clean_rel"; then
+            # Pelo menos um arquivo da tradução não está aplicado: jogo não está traduzido.
+            # Remove eventual backup órfão deixado após desinstalar o jogo pela Steam.
+            if [ -d "$game_root/_backup_linux_traducoes" ]; then
+                rm -rf "$game_root/_backup_linux_traducoes"
+            fi
+            return 1
         fi
     done < <(cd "$APPDIR/payload" && find . -type f -print0)
 
-    return 1
+    [ "$total_files" -gt 0 ]
 }
 
 # --- Desinstala a tradução e restaura o backup original ---
@@ -295,7 +333,12 @@ if [ -n "$FOUND_DIR" ]; then
 fi
 
 if [ -z "$GAME_ROOT" ]; then
-    ui_info "Selecione manualmente a pasta raiz onde <b>$GAME_NAME</b> está instalado."
+    if [ -z "$FOUND_DIR" ]; then
+        if ! ui_game_not_found; then
+            exit 1
+        fi
+    fi
+
     GAME_ROOT="$(ui_select_dir || true)"
 
     if [ -z "$GAME_ROOT" ] || [ ! -d "$GAME_ROOT" ]; then
@@ -334,7 +377,7 @@ while IFS= read -r -d '' rel_file; do
 done < <(cd "$APPDIR/payload" && find . -type f -print0)
 
 # --- Copia os arquivos da tradução ---
-cp -rf "$APPDIR/payload/." "$TARGET_DIR/"
+cp -rf --remove-destination "$APPDIR/payload/." "$TARGET_DIR/"
 
 ui_info "Tradução de <b>$GAME_NAME</b> instalada com sucesso!\n\n<b>Créditos:</b> $CREDITS\n<b>Backup salvo em:</b> _backup_linux_traducoes"
 """
@@ -429,12 +472,11 @@ def detectar_metadados_steam(game_dir: Path) -> dict:
 
 
 def analisar_estrutura_traducao(trad_dir: Path, game_dir: Path) -> dict:
+    def is_junk(name: str) -> bool:
+        return name.lower() in JUNK_NAMES or name.startswith(".")
+
     def listar_validos(pasta: Path):
-        return [
-            p
-            for p in pasta.iterdir()
-            if p.name.lower() not in JUNK_NAMES and not p.name.startswith(".")
-        ]
+        return [p for p in pasta.iterdir() if not is_junk(p.name)]
 
     source_root = trad_dir
     itens = listar_validos(source_root)
@@ -446,52 +488,60 @@ def analisar_estrutura_traducao(trad_dir: Path, game_dir: Path) -> dict:
         source_root = itens[0]
         itens = listar_validos(source_root)
 
-    sub_path = ""
-    nomes_trad = {p.name for p in itens}
-    nomes_jogo = {p.name for p in game_dir.iterdir()} if game_dir.is_dir() else set()
-
-    correspondencias_raiz = nomes_trad.intersection(nomes_jogo)
-    if correspondencias_raiz:
-        sub_path = ""
-    else:
-        if (game_dir / source_root.name).is_dir():
-            sub_path = source_root.name
-        else:
-            melhor_sub = ""
-            melhor_score = 0
-            for root, dirs, files in os.walk(game_dir):
-                rel = Path(root).relative_to(game_dir)
-                if len(rel.parts) > 4:
-                    continue
-                candidatos = set(dirs) | set(files)
-                score = len(nomes_trad.intersection(candidatos))
-                if score > melhor_score:
-                    melhor_score = score
-                    melhor_sub = "" if str(rel) == "." else str(rel)
-            sub_path = melhor_sub
-
-    total_arquivos = 0
-    substituicoes = 0
-    target_base = game_dir / sub_path if sub_path else game_dir
-
+    rel_files = []
     for root, dirs, files in os.walk(source_root):
-        dirs[:] = [d for d in dirs if d.lower() not in JUNK_NAMES]
+        dirs[:] = [d for d in dirs if not is_junk(d)]
         for f in files:
-            if f.lower() in JUNK_NAMES:
+            if not is_junk(f):
+                rel_files.append((Path(root) / f).relative_to(source_root))
+
+    candidatos = [""]
+    if game_dir.is_dir():
+        if (game_dir / source_root.name).is_dir():
+            candidatos.append(source_root.name)
+        for root, dirs, _files in os.walk(game_dir):
+            rel = Path(root).relative_to(game_dir)
+            if len(rel.parts) > 4:
                 continue
-            total_arquivos += 1
-            rel_file = (Path(root) / f).relative_to(source_root)
-            if (target_base / rel_file).exists():
-                substituicoes += 1
+            rel_str = "" if str(rel) == "." else str(rel)
+            if rel_str not in candidatos:
+                candidatos.append(rel_str)
+
+    melhor_sub = ""
+    melhor_file_score = 0
+    for cand in candidatos:
+        base = game_dir / cand if cand else game_dir
+        score = sum(1 for rf in rel_files if (base / rf).is_file())
+        if score > melhor_file_score:
+            melhor_file_score = score
+            melhor_sub = cand
+
+    if melhor_file_score == 0 and game_dir.is_dir():
+        nomes_trad = {p.name for p in itens}
+        melhor_name_score = 0
+        for cand in candidatos:
+            base = game_dir / cand if cand else game_dir
+            if not base.is_dir():
+                continue
+            nomes_base = {p.name for p in base.iterdir()}
+            score = len(nomes_trad.intersection(nomes_base))
+            if cand == source_root.name and score > 0:
+                score += 10
+            if score > melhor_name_score:
+                melhor_name_score = score
+                melhor_sub = cand
+
+    sub_path = melhor_sub
+    target_base = game_dir / sub_path if sub_path else game_dir
+    substituicoes = sum(1 for rf in rel_files if (target_base / rf).is_file())
 
     return {
         "source_root": source_root,
         "sub_path": sub_path,
-        "total_arquivos": total_arquivos,
+        "total_arquivos": len(rel_files),
         "substituicoes": substituicoes,
         "itens_raiz": [p.name for p in itens],
     }
-
 
 def preparar_appimagetool() -> Path:
     """Baixa e extrai o appimagetool uma única vez para evitar problemas com FUSE / /tmp."""
